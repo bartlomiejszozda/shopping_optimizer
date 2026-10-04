@@ -40,6 +40,8 @@ yarn-error.log*
 next-env.d.ts
 /dist/
 /.wrangler/
+# Local store exports contain shopping lists and map data.
+/backups/
 # Checkout-local execution profile and tool state; never publish them.
 /.sites-runtime/
 /.agents/

@@ -15,6 +15,7 @@ type AreaOverlay = { key: string; label: string; area: Area; categoryId: string 
 type CategorySuggestion = { categoryId: string; percentage: number };
 type SuggestionResult = { suggestions: CategorySuggestion[]; recommendedCategoryId: string | null };
 const normalize = (name: string) => name.trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+const sameArea = (a: Area | null, b: Area | null) => a === b || (!!a && !!b && a.x === b.x && a.y === b.y && a.width === b.width && a.height === b.height);
 const parseList = (input: string) => Array.from(new Map(input.split(/\r?\n|,/)
   .map(line => line.replace(/^\s*(?:[-*•]\s+|\d+[.)]\s+)/, '').trim())
   .filter(Boolean).map(name => [normalize(name), name] as const)).values()).slice(0, 300);
@@ -33,6 +34,8 @@ function CategoryPicker({ categories, value, onChange, label }: {
 export default function Page() {
   const [view, setView] = useState<View>('shopping');
   const [store, setStore] = useState<StoreSnapshot | null>(null);
+  const [maps, setMaps] = useState<{ mapId: number; name: string }[]>([]);
+  const [newMapName, setNewMapName] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [busy, setBusy] = useState(false);
@@ -49,17 +52,18 @@ export default function Page() {
   const suggestionRequest = useRef<{ key: string; promise: Promise<SuggestionResult> } | null>(null);
   const addingProduct = useRef(false);
   const [newCategoryName, setNewCategoryName] = useState('');
+  const [draftCategoryName, setDraftCategoryName] = useState('');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<Selection | null>(null);
+  const [categoriesAtPoint, setCategoriesAtPoint] = useState<string[] | null>(null);
   const [keyboardPoint, setKeyboardPoint] = useState({ x: 0.5, y: 0.5 });
   const [draftArea, setDraftArea] = useState<Area | null>(null);
-  const [editingAreaId, setEditingAreaId] = useState<string | null>(null);
   const [redrawArea, setRedrawArea] = useState(false);
   const areaDrag = useRef<AreaDrag | null>(null);
   const areaBeforeDrag = useRef<Area | null>(null);
+  const suppressMapClick = useRef(false);
   const [done, setDone] = useState<string[]>([]);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
-  const [editingCategory, setEditingCategory] = useState<Category | null>(null);
   const [deleteProductTarget, setDeleteProductTarget] = useState<Product | null>(null);
   const [deleteCategoryTarget, setDeleteCategoryTarget] = useState<Category | null>(null);
   const [replaceFile, setReplaceFile] = useState<File | null>(null);
@@ -67,7 +71,13 @@ export default function Page() {
 
   const load = useCallback(async () => {
     try {
-      const response = await fetch('/api/state', { cache: 'no-store' });
+      const savedMapId = localStorage.getItem('aisle-map-id');
+      const mapId = savedMapId && /^[1-9][0-9]*$/.test(savedMapId) ? savedMapId : '1';
+      let response = await fetch(`/api/state?mapId=${mapId}`, { cache: 'no-store' });
+      if (response.status === 404) response = await fetch('/api/state', { cache: 'no-store' });
+      const mapsResponse = await fetch('/api/maps', { cache: 'no-store' });
+      if (!mapsResponse.ok) throw new Error('Could not load maps.');
+      setMaps(await mapsResponse.json());
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Could not load your store.');
       setStore(data);
@@ -79,9 +89,9 @@ export default function Page() {
 
   const categorySignature = (store?.categories ?? []).map(category => `${category.id}:${category.name}`).join('|');
   const requestSuggestions = useCallback((name: string, signature: string) => {
-    const key = `${normalize(name)}|${signature}`;
+    const key = `${store?.mapId ?? 1}|${normalize(name)}|${signature}`;
     if (suggestionRequest.current?.key === key) return suggestionRequest.current.promise;
-    const promise = fetch('/api/category-suggestions', {
+    const promise = fetch(`/api/category-suggestions?mapId=${store?.mapId ?? 1}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
     }).then(async response => {
       const result = await response.json() as SuggestionResult & { error?: string };
@@ -93,7 +103,7 @@ export default function Page() {
     });
     suggestionRequest.current = { key, promise };
     return promise;
-  }, []);
+  }, [store?.mapId]);
   useEffect(() => {
     const name = newProductName.trim().replace(/\s+/g, ' ');
     const generation = ++suggestionGeneration.current;
@@ -124,7 +134,7 @@ export default function Page() {
     if (!store || busy) return false;
     setBusy(true); setError(''); setMessage('');
     try {
-      const response = await fetch('/api/state', {
+      const response = await fetch(`/api/state?mapId=${store.mapId}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ revision: store.revision, products: patch.products ?? store.products,
           categories: patch.categories ?? store.categories, shoppingList: patch.shoppingList ?? store.shoppingList }),
@@ -150,9 +160,10 @@ export default function Page() {
   const visibleCategories = [...(store?.categories ?? [])].sort((a,b) => a.name.localeCompare(b.name));
   const activeProduct = selected?.kind === 'product' ? store?.products.find(product => product.id === selected.id) : null;
   const activeCategory = selected?.kind === 'category' ? store?.categories.find(category => category.id === selected.id) : null;
-  const editingArea = !!activeCategory && editingAreaId === activeCategory.id;
+  const editingArea = view === 'categories' && !!activeCategory;
+  const categoryDirty = !!activeCategory && (draftCategoryName.trim().replace(/\s+/g, ' ') !== activeCategory.name || !sameArea(draftArea, activeCategory.area));
   const activeLabel = activeProduct?.name ?? activeCategory?.name ?? selected?.id ?? '';
-  const mapUrl = store?.map ? `/api/map?v=${store.map.version}` : '';
+  const mapUrl = store?.map ? `/api/map?mapId=${store.mapId}&v=${store.map.version}` : '';
 
   const markers = useMemo(() => {
     if (!store) return [] as Marker[];
@@ -198,34 +209,38 @@ export default function Page() {
 
   function selectProduct(product: Product) {
     setSelected({ kind: 'product', id: product.id });
+    setCategoriesAtPoint(null);
     const location = productLocation(product, store?.categories ?? []);
     setKeyboardPoint(location?.kind === 'point' ? { x: location.x, y: location.y } : location?.kind === 'area' ? areaCenter(location.area) : { x: 0.5, y: 0.5 });
     setMessage(product.x !== null ? `Click the map to move ${product.name}.` : location ? `${product.name} uses its category area. Click the map to give it a specific point.` : `Click the map to place ${product.name}.`);
   }
-  function selectCategory(category: Category) {
+  function selectCategory(category: Category, keepLookup = false) {
+    if (activeCategory?.id === category.id) {
+      if (!keepLookup) setCategoriesAtPoint(null);
+      return;
+    }
+    if (activeCategory && activeCategory.id !== category.id && categoryDirty) {
+      setError(`Save or cancel changes to ${activeCategory.name} before selecting another category.`);
+      return;
+    }
     setSelected({ kind: 'category', id: category.id });
     setDraftArea(category.area);
-    setEditingAreaId(null);
+    setDraftCategoryName(category.name);
     setRedrawArea(false);
-    setMessage(`Click Edit to ${category.area ? 'reshape' : 'draw'} the ${category.name} area.`);
-  }
-  function editCategoryArea(category: Category) {
-    setSelected({ kind: 'category', id: category.id });
-    setDraftArea(category.area);
-    setEditingAreaId(category.id);
-    setRedrawArea(false);
-    setMessage(category.area ? `Drag inside ${category.name} to move it, or drag an edge to resize it. Press Enter or Save changes when ready.` : `Draw the ${category.name} area, then press Enter or Save changes.`);
+    if (!keepLookup) setCategoriesAtPoint(null);
+    setError('');
+    setMessage(category.area ? `Drag inside ${category.name} to move it, or drag an edge to resize it. Save when ready.` : `Draw the ${category.name} area, then save.`);
   }
   function cancelCategoryArea() {
     setDraftArea(activeCategory?.area ?? null);
-    setEditingAreaId(null);
+    setDraftCategoryName(activeCategory?.name ?? '');
     setRedrawArea(false);
     setMessage('Category changes cancelled.');
   }
   function selectMissing(name: string) {
     const product = productsByName.get(normalize(name));
     if (product) selectProduct(product);
-    else { setSelected({ kind: 'missing', id: name }); setKeyboardPoint({ x: 0.5, y: 0.5 }); setMessage(`Click the map where you find ${name}.`); }
+    else { setSelected({ kind: 'missing', id: name }); setCategoriesAtPoint(null); setKeyboardPoint({ x: 0.5, y: 0.5 }); setMessage(`Click the map where you find ${name}.`); }
   }
   function selectMarker(marker: Marker) {
     if (!store) return;
@@ -246,35 +261,53 @@ export default function Page() {
       setSelected(null); setMessage(`${name} saved on the map.`);
     }
   }
-  function placeOnMap(event: MouseEvent<HTMLDivElement>) {
+  function onMapClick(event: MouseEvent<HTMLDivElement>) {
+    if (suppressMapClick.current) { suppressMapClick.current = false; return; }
     const rect = event.currentTarget.getBoundingClientRect();
-    void placeAt(Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)), Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)));
+    const point = { x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)) };
+    if (selected && selected.kind !== 'category') { void placeAt(point.x, point.y); return; }
+    if (!store) return;
+    const matching = store.categories.filter(category => {
+      const area = category.id === activeCategory?.id ? draftArea : category.area;
+      return !!area && pointInArea(point, area);
+    });
+    setCategoriesAtPoint(matching.map(category => category.id));
+    if (matching.length === 1) {
+      if (view !== 'categories') setView('categories');
+      selectCategory(matching[0], true);
+    }
   }
   function positionFromPointer(event: PointerEvent<HTMLDivElement>) {
     const rect = event.currentTarget.getBoundingClientRect();
     return { x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
       y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)) };
   }
-  async function saveCategoryArea(area: Area) {
-    if (!store?.map || selected?.kind !== 'category' || !editingArea || busy) return;
-    const category = store.categories.find(item => item.id === selected.id);
-    if (!category) return;
-    const categories = store.categories.map(item => item.id === category.id ? { ...item, area } : item);
-    const moved = category.area ? moveProductsWithArea(store.products, category.id, category.area, area) : store.products;
-    const products = moved.map(product => product.categoryId === category.id
-      ? placeProductInCategory(product, categories, !category.area && product.x === null)
-      : product);
+  async function saveCategoryChanges() {
+    if (!store || !activeCategory || busy || redrawArea) return;
+    const name = draftCategoryName.trim().replace(/\s+/g, ' ');
+    if (!name || name.length > 100 || normalize(name) === 'uncategorized' || store.categories.some(item => item.id !== activeCategory.id && normalize(item.name) === normalize(name))) {
+      setError('Enter a unique category name of up to 100 characters.'); return;
+    }
+    if (!draftArea && activeCategory.area) { setError('Draw the new area, or cancel to keep the current area.'); return; }
+    if (draftArea && !store.map) { setError('Upload a map before drawing a category area.'); return; }
+    if (!categoryDirty) return;
+    const areaChanged = !sameArea(draftArea, activeCategory.area);
+    const categories = store.categories.map(item => item.id === activeCategory.id ? { ...item, name, area: draftArea } : item);
+    const moved = areaChanged && activeCategory.area && draftArea
+      ? moveProductsWithArea(store.products, activeCategory.id, activeCategory.area, draftArea) : store.products;
+    const products = areaChanged && draftArea ? moved.map(product => product.categoryId === activeCategory.id
+      ? placeProductInCategory(product, categories, !activeCategory.area && product.x === null)
+      : product) : store.products;
     if (await save({ categories, products })) {
-      setDraftArea(area); setEditingAreaId(null); setRedrawArea(false); setMessage(`${category.name} area and its product pins saved.`);
+      setDraftCategoryName(name); setRedrawArea(false); setCategoriesAtPoint(null); setMessage(areaChanged ? `${name} and its product pins saved.` : `${name} saved.`);
     }
   }
   function areaPointerDown(event: PointerEvent<HTMLDivElement>) {
+    suppressMapClick.current = false;
     if (!editingArea || busy) return;
-    event.preventDefault();
-    event.currentTarget.focus();
     const point = positionFromPointer(event);
     const area = draftArea;
-    areaBeforeDrag.current = area;
     if (area && !redrawArea) {
       const rect = event.currentTarget.getBoundingClientRect();
       const edgeX = 12 / rect.width;
@@ -293,14 +326,19 @@ export default function Page() {
       };
       areaDrag.current = edges.left || edges.right || edges.top || edges.bottom
         ? { mode: 'resize', start: point, original: area, edges }
-        : inside ? { mode: 'move', start: point, original: area } : { mode: 'draw', start: point };
+        : inside ? { mode: 'move', start: point, original: area } : null;
     } else areaDrag.current = { mode: 'draw', start: point };
+    if (!areaDrag.current) return;
+    event.currentTarget.focus();
+    areaBeforeDrag.current = area;
     if (areaDrag.current.mode === 'draw') setDraftArea(areaFromDrag(areaDrag.current, point));
     event.currentTarget.setPointerCapture(event.pointerId);
   }
   function areaPointerMove(event: PointerEvent<HTMLDivElement>) {
     if (!areaDrag.current) return;
-    setDraftArea(areaFromDrag(areaDrag.current, positionFromPointer(event)));
+    const point = positionFromPointer(event);
+    if (Math.abs(point.x - areaDrag.current.start.x) > 0.003 || Math.abs(point.y - areaDrag.current.start.y) > 0.003) suppressMapClick.current = true;
+    setDraftArea(areaFromDrag(areaDrag.current, point));
   }
   function areaPointerUp(event: PointerEvent<HTMLDivElement>) {
     if (!areaDrag.current) return;
@@ -314,6 +352,7 @@ export default function Page() {
       : areaFromDrag(drag, end);
     setDraftArea(area);
     setRedrawArea(false);
+    if (drag.mode === 'draw' || Math.abs(end.x - drag.start.x) > 0.003 || Math.abs(end.y - drag.start.y) > 0.003) suppressMapClick.current = true;
   }
   function mapKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (!selected) return;
@@ -322,6 +361,7 @@ export default function Page() {
       if (!editingArea) return;
       if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) {
         event.preventDefault();
+        setRedrawArea(false);
         setDraftArea(previous => {
           const area = previous ?? { x: 0.4, y: 0.4, width: 0.2, height: 0.2 };
           const dx = event.key === 'ArrowRight' ? 0.01 : event.key === 'ArrowLeft' ? -0.01 : 0;
@@ -329,7 +369,7 @@ export default function Page() {
           if (event.shiftKey) return { ...area, width: Math.max(0.005, Math.min(1 - area.x, area.width + dx)), height: Math.max(0.005, Math.min(1 - area.y, area.height + dy)) };
           return { ...area, x: Math.max(0, Math.min(1 - area.width, area.x + dx)), y: Math.max(0, Math.min(1 - area.height, area.y + dy)) };
         });
-      } else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); if (draftArea) void saveCategoryArea(draftArea); }
+      } else if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); void saveCategoryChanges(); }
       return;
     }
     if (['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) {
@@ -380,11 +420,12 @@ export default function Page() {
   }
   async function addCategory() {
     if (!store) return;
+    if (categoryDirty) { setError(`Save or cancel changes to ${activeCategory?.name} before adding a category.`); return; }
     const name = newCategoryName.trim().replace(/\s+/g, ' ');
     if (!name || name.length > 100 || normalize(name) === 'uncategorized') { setError('Enter a category name of up to 100 characters.'); return; }
     if (store.categories.some(category => normalize(category.name) === normalize(name))) { setError('That category already exists.'); return; }
     const category: Category = { id: crypto.randomUUID(), name, area: null };
-    if (await save({ categories: [...store.categories, category] })) { setNewCategoryName(''); selectCategory(category); }
+    if (await save({ categories: [...store.categories, category] })) { setNewCategoryName(''); setView('categories'); selectCategory(category); }
   }
   async function updateProduct() {
     if (!store || !editingProduct) return;
@@ -398,12 +439,6 @@ export default function Page() {
       setEditingProduct(null); setListText(shoppingList.join('\n'));
     }
   }
-  async function updateCategory() {
-    if (!store || !editingCategory) return;
-    const name = editingCategory.name.trim().replace(/\s+/g, ' ');
-    if (!name || name.length > 100 || normalize(name) === 'uncategorized' || store.categories.some(item => item.id !== editingCategory.id && normalize(item.name) === normalize(name))) { setError('Enter a unique category name of up to 100 characters.'); return; }
-    if (await save({ categories: store.categories.map(item => item.id === editingCategory.id ? { ...editingCategory, name } : item) })) setEditingCategory(null);
-  }
   async function deleteProduct() {
     if (!store || !deleteProductTarget) return;
     if (await save({ products: store.products.filter(item => item.id !== deleteProductTarget.id) })) { setSelected(null); setDeleteProductTarget(null); }
@@ -411,7 +446,7 @@ export default function Page() {
   async function deleteCategory() {
     if (!store || !deleteCategoryTarget) return;
     if (await save({ categories: store.categories.filter(item => item.id !== deleteCategoryTarget.id), products: store.products.map(item => item.categoryId === deleteCategoryTarget.id ? { ...item, categoryId: null } : item) })) {
-      setSelected(null); setDeleteCategoryTarget(null);
+      setSelected(null); setDeleteCategoryTarget(null); setCategoriesAtPoint(null);
       if (newProductCategory === deleteCategoryTarget.id) setNewProductCategory(null);
     }
   }
@@ -425,7 +460,7 @@ export default function Page() {
       bitmap.close();
       if (width < 32 || height < 32 || width > 10000 || height > 10000) throw new Error('Choose an image between 32 and 10,000 pixels on each side.');
       const form = new FormData(); form.append('image', file); form.append('width', String(width)); form.append('height', String(height)); form.append('revision', String(store.revision));
-      const response = await fetch('/api/map', { method: 'POST', body: form });
+      const response = await fetch(`/api/map?mapId=${store.mapId}`, { method: 'POST', body: form });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Could not upload map.');
       setStore(data); setSelected(null); setView('map'); setMessage('Map saved. Product and category locations can now be placed.');
@@ -438,16 +473,51 @@ export default function Page() {
     if (store?.map) setReplaceFile(file); else void uploadFile(file);
   }
 
+  function activateMap(data: StoreSnapshot) {
+    suggestionGeneration.current++;
+    suggestionRequest.current = null;
+    manualCategoryChoice.current = false;
+    areaDrag.current = null; areaBeforeDrag.current = null;
+    setStore(data); setListText(data.shoppingList.join('\n')); setDone([]);
+    setSelected(null); setCategoriesAtPoint(null); setDraftArea(null); setDraftCategoryName(''); setRedrawArea(false);
+    setEditingProduct(null); setDeleteProductTarget(null); setDeleteCategoryTarget(null); setReplaceFile(null);
+    setNewProductName(''); setNewProductCategory(null); setNewCategoryName(''); setSearch('');
+    setCategorySuggestions([]); setRecommendedCategoryId(null); setSuggestionsFor(''); setSuggestionError(''); setSuggesting(false);
+    if (fileInput.current) fileInput.current.value = '';
+    localStorage.setItem('aisle-map-id', String(data.mapId));
+  }
+  async function changeMap(mapId?: number) {
+    if (busy || addingProduct.current) return;
+    if (categoryDirty || (store && JSON.stringify(parseList(listText)) !== JSON.stringify(store.shoppingList))) {
+      setError('Save or cancel category changes and save your shopping list before switching maps.'); return;
+    }
+    if (mapId === undefined && !newMapName.trim()) { setError('Enter a name for the new map.'); return; }
+    setBusy(true); setError(''); setMessage('');
+    try {
+      const response = mapId === undefined
+        ? await fetch('/api/maps', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: newMapName }) })
+        : await fetch(`/api/state?mapId=${mapId}`, { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not open map.');
+      activateMap(data);
+      if (mapId === undefined) {
+        setMaps(current => [...current, { mapId: data.mapId, name: data.name }]);
+        setNewMapName(''); setView('map'); setMessage('Map created. Upload its drawing to get started.');
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Could not open map.'); }
+    finally { setBusy(false); }
+  }
+
   const mapPanel = <section className="map-panel">
-    <div className="panel-top"><h2>Your store map</h2><div className="map-toolbar">
+    <div className="panel-top"><h2>{store?.name ?? 'Your store map'}</h2><div className="map-toolbar">
       {store?.map && <span className="pill">{markers.length + areas.length} location{markers.length + areas.length === 1 ? '' : 's'}</span>}
       <button className="secondary" onClick={() => fileInput.current?.click()} disabled={busy}><Upload size={15}/>{store?.map ? 'Replace map' : 'Upload map'}</button>
     </div></div>
     <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/webp" onChange={chooseFile} hidden />
     {store?.map ? <>
       <div className="map-stage"><div className={`map-image-wrap ${selected && (selected.kind !== 'category' || editingArea) ? 'placing' : ''} ${editingArea ? 'drawing-area' : ''}`} style={{ width: `min(100%, ${store.map.width}px)` }}
-        onClick={placeOnMap} onPointerDown={areaPointerDown} onPointerMove={areaPointerMove} onPointerUp={areaPointerUp}
-        onPointerCancel={() => { if (areaDrag.current) setDraftArea(areaBeforeDrag.current); areaDrag.current = null; areaBeforeDrag.current = null; }}
+        onClick={onMapClick} onPointerDown={areaPointerDown} onPointerMove={areaPointerMove} onPointerUp={areaPointerUp}
+        onPointerCancel={() => { if (areaDrag.current) setDraftArea(areaBeforeDrag.current); areaDrag.current = null; areaBeforeDrag.current = null; suppressMapClick.current = false; }}
         role={selected && (selected.kind !== 'category' || editingArea) ? 'button' : undefined} aria-label={selected ? selected.kind === 'category' ? editingArea ? `Move or resize ${activeLabel} area. Use arrow keys to move, Shift and arrows to resize, Enter to save.` : undefined : `Place ${activeLabel} on map. Use arrow keys to move and Enter to place.` : undefined}
         tabIndex={selected && (selected.kind !== 'category' || editingArea) ? 0 : undefined} onKeyDown={mapKeyDown}>
         <img src={mapUrl} alt="Uploaded store drawing" draggable={false}/>
@@ -465,8 +535,12 @@ export default function Page() {
           <span className="marker-label">{marker.label}</span>
         </button>)}
         {selected && selected.kind !== 'category' && <span className="keyboard-marker" style={{ left: `${keyboardPoint.x * 100}%`, top: `${keyboardPoint.y * 100}%` }} aria-hidden="true">+</span>}
+        {categoriesAtPoint !== null && <div className="category-hit-list" onClick={event => event.stopPropagation()} onPointerDown={event => event.stopPropagation()}>
+          <div className="category-hit-heading"><b>Categories here</b><button className="icon-button" aria-label="Close category list" onClick={() => setCategoriesAtPoint(null)}>×</button></div>
+          {categoriesAtPoint.length ? categoriesAtPoint.map(id => { const category = store.categories.find(item => item.id === id); return category && <button key={id} className={`category-hit-option ${selected?.kind === 'category' && selected.id === id ? 'active' : ''}`} onClick={() => { setView('categories'); selectCategory(category, true); }}>{category.name}</button>; }) : <span className="muted">No category at this spot.</span>}
+        </div>}
       </div></div>
-      <div className="map-bottom"><span>{editingArea ? draftArea && !redrawArea ? `Drag inside ${activeLabel} to move, or drag an edge to resize. Press Enter to save` : `Drag to draw ${activeLabel}, then press Enter to save` : selected?.kind === 'category' ? `Viewing ${activeLabel}. Click Edit to change its area` : selected ? `Click to place ${activeLabel}, or use arrow keys and Enter` : view === 'shopping' ? 'Showing your shopping list' : view === 'categories' ? 'Showing category areas' : 'Showing products and category areas'}</span>
+      <div className="map-bottom"><span>{editingArea ? draftArea && !redrawArea ? `Drag inside ${activeLabel} to move, or drag an edge to resize. Press Enter to save` : `Drag to draw ${activeLabel}, then press Enter to save` : selected ? `Click to place ${activeLabel}, or use arrow keys and Enter` : view === 'shopping' ? 'Showing your shopping list' : 'Click a category area to inspect it'}</span>
         <div className="legend"><span><i className="swatch"/>Shelves</span><span><i className="swatch white"/>Walkways</span></div>
       </div>
     </> : <div className="empty-map"><Upload size={34}/><h2>Bring your store into view</h2><p>Upload your drawing to start placing products and categories.</p><button className="primary" onClick={() => fileInput.current?.click()} disabled={busy}>Choose a store image</button><small>PNG, JPG or WebP · up to 10 MB</small></div>}
@@ -474,10 +548,21 @@ export default function Page() {
 
   return <main className="app-shell">
     <header><a className="brand" href="/"><span className="brand-icon"><MapPin size={24}/></span>aisle<span className="brand-period">.</span></a><span className="header-note">Your store, remembered.</span></header>
-    <section className="page-heading"><div><span className="eyebrow">YOUR SHOPPING COMPANION</span><h1>A place for everything.</h1><p>Your store map and the things you came for, together.</p></div><span className="store-badge"><MapPin size={16}/> One store. All your essentials.</span></section>
+    <section className="page-heading"><div><span className="eyebrow">YOUR SHOPPING COMPANION</span><h1>A place for everything.</h1><p>Your store map and the things you came for, together.</p></div><span className="store-badge"><MapPin size={16}/> Your stores. All your essentials.</span></section>
     {error && <div className="notice error" role="alert">{error} <button className="icon-button" onClick={() => { setError(''); void load(); }} aria-label="Reload store"><RotateCcw size={16}/></button></div>}
     {message && !error && <div className="notice" role="status">{message}</div>}
-    {!store ? <div className="loading">Loading your store…</div> : <Tabs value={view} onValueChange={value => { setView(value as View); setSelected(null); setEditingAreaId(null); setDraftArea(null); setRedrawArea(false); setMessage(''); }}>
+    {store && <section className="map-switcher" aria-label="Maps">
+      <div><label className="field-label" htmlFor="active-map">Current map</label>
+        <select id="active-map" value={store.mapId} disabled={busy || suggesting} onChange={event => void changeMap(Number(event.target.value))}>
+          {maps.map(map => <option key={map.mapId} value={map.mapId}>{map.name}</option>)}
+        </select>
+      </div>
+      <div><label className="field-label" htmlFor="new-map-name">New map</label><div className="row">
+        <input id="new-map-name" placeholder="e.g. Supermarket near home" maxLength={100} value={newMapName} disabled={busy} onChange={event => setNewMapName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void changeMap(); }}/>
+        <button className="secondary" disabled={busy || suggesting || !newMapName.trim()} onClick={() => void changeMap()}><Plus size={16}/>Add map</button>
+      </div></div>
+    </section>}
+    {!store ? <div className="loading">Loading your store…</div> : <Tabs value={view} onValueChange={value => { if (categoryDirty) { setError(`Save or cancel changes to ${activeCategory?.name} before leaving Categories.`); return; } setView(value as View); setSelected(null); setDraftArea(null); setDraftCategoryName(''); setCategoriesAtPoint(null); setRedrawArea(false); setMessage(''); }}>
       <TabsList className="navigation"><TabsTrigger value="shopping"><ShoppingBasket/>Shopping list</TabsTrigger><TabsTrigger value="products"><MapPin/>Products</TabsTrigger><TabsTrigger value="categories"><Layers/>Categories</TabsTrigger><TabsTrigger value="map"><Upload/>Store map</TabsTrigger></TabsList>
       <TabsContent value="shopping"><div className="workspace"><aside className="panel">
         <span className="eyebrow">01 / YOUR TRIP</span><h2>Shopping list</h2><p>Paste one product per line. Items appear as points or inside their category areas on the map.</p>
@@ -525,26 +610,25 @@ export default function Page() {
         </div>
       </aside>{mapPanel}</div></TabsContent>
       <TabsContent value="categories"><div className="workspace"><aside className="panel">
-        <span className="eyebrow">03 / STORE SECTIONS</span><h2>Categories</h2><p>Click a category to view it, or its Edit button to draw and reshape its area. Product pins move proportionally when you save.</p>
+        <span className="eyebrow">03 / STORE SECTIONS</span><h2>Categories</h2><p>Click a category here or on the map to edit it. If areas overlap, choose from every category at that spot. Product pins move proportionally when you save.</p>
+        {activeCategory && <div className="instruction category-editor">
+          <b>Editing {activeCategory.name}</b>
+          <label className="field-label" htmlFor="edit-category-name">Category name</label>
+          <input id="edit-category-name" value={draftCategoryName} onChange={event => setDraftCategoryName(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void saveCategoryChanges(); }}/>
+          <p>{draftArea ? 'Drag inside the outlined area to move it or drag an edge to resize it. Changes remain a preview until you save.' : 'Drag on the map to draw this category’s area.'}</p>
+          <div className="editor-actions">
+            <button className="secondary" onClick={() => { setDraftArea(null); setRedrawArea(true); setCategoriesAtPoint(null); setMessage(`Drag anywhere on the map to draw ${activeCategory.name}.`); }} disabled={busy}>Draw new area</button>
+            <button className="primary" onClick={() => void saveCategoryChanges()} disabled={busy || !categoryDirty || redrawArea || (!draftArea && !!activeCategory.area)}>Save changes</button>
+            <button className="secondary" onClick={cancelCategoryArea} disabled={busy || (!categoryDirty && !redrawArea)}>Cancel</button>
+          </div>
+        </div>}
         <label className="field-label" htmlFor="category-name">Add a category</label><div className="row"><input id="category-name" value={newCategoryName} onChange={event => setNewCategoryName(event.target.value)} placeholder="e.g. Dairy" onKeyDown={event => { if (event.key === 'Enter') void addCategory(); }}/><button className="primary" onClick={() => void addCategory()} disabled={busy} aria-label="Add category"><Plus size={18}/></button></div>
         <div className="list-heading">Your categories · {store.categories.length}</div><div className="item-list">
           {visibleCategories.map(category => <div className={`item ${selected?.kind === 'category' && selected.id === category.id ? 'active' : ''}`} key={category.id}>
             <span className={`number ${category.area === null ? 'unknown-number' : ''}`}><Layers size={15}/></span><button className="item-name" onClick={() => selectCategory(category)}>{category.name}<small>{store.products.filter(product => product.categoryId === category.id).length} products · {category.area === null ? 'Draw an area' : 'Area drawn'}</small></button>
-            <button className="icon-button" aria-label={`Edit ${category.name} area`} title="Edit area" onClick={() => editCategoryArea(category)}><Pencil size={16}/></button><button className="icon-button" aria-label={`Delete ${category.name}`} title="Delete" onClick={() => setDeleteCategoryTarget(category)}><Trash2 size={16}/></button>
+            <button className="icon-button" aria-label={`Delete ${category.name}`} title="Delete" onClick={() => setDeleteCategoryTarget(category)}><Trash2 size={16}/></button>
           </div>)}{visibleCategories.length === 0 && <p className="muted">Add your first category above.</p>}
         </div>
-        {selected?.kind === 'category' && activeCategory && <div className="instruction">
-          <b>{editingArea ? `Editing ${activeCategory.name}` : `Viewing ${activeCategory.name}`}</b>
-          <p>{editingArea ? draftArea ? 'Drag inside to move the area or drag a square to resize it. Changes are only a preview until you save.' : 'Drag on the map to draw an area.' : 'Use the Edit button beside this category to change its area.'}</p>
-          <div className="editor-actions">
-            {editingArea && <>
-              {draftArea && <button className="secondary" onClick={() => { setDraftArea(null); setRedrawArea(true); setMessage(`Drag anywhere on the map to redraw ${activeCategory.name}.`); }} disabled={busy}>Draw new area</button>}
-              <button className="primary" onClick={() => { if (draftArea) void saveCategoryArea(draftArea); }} disabled={busy || !draftArea}>Save changes</button>
-              <button className="secondary" onClick={cancelCategoryArea} disabled={busy}>Cancel</button>
-            </>}
-            <button className="secondary" onClick={() => setEditingCategory({...activeCategory})} disabled={busy}>Rename</button>
-          </div>
-        </div>}
       </aside>{mapPanel}</div></TabsContent>
       <TabsContent value="map"><div className="workspace"><aside className="panel"><span className="eyebrow">04 / STORE MAP</span><h2>Start with your store.</h2><p>Draw your store in Paint, then upload it here. Shelves in black, walkways in white.</p><div className="instruction"><b>Keep it simple</b><p>A rough drawing is enough. Click to place a product point; drag to draw a category area.</p></div>{store.map && <p className="upload-note">Open <b>Products</b> or <b>Categories</b>, select one, then mark its place on the map.</p>}</aside>{mapPanel}</div></TabsContent>
     </Tabs>}
@@ -552,7 +636,6 @@ export default function Page() {
     <AlertDialog open={!!deleteProductTarget} onOpenChange={open => { if (!open) setDeleteProductTarget(null); }}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Delete {deleteProductTarget?.name}?</AlertDialogTitle><AlertDialogDescription>This removes its saved location and category assignment. The name will remain on your shopping list, if it is there.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void deleteProduct()}>Delete product</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
     <AlertDialog open={!!deleteCategoryTarget} onOpenChange={open => { if (!open) setDeleteCategoryTarget(null); }}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Delete {deleteCategoryTarget?.name}?</AlertDialogTitle><AlertDialogDescription>Products in this category will become Uncategorized. Their individual map positions will stay.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void deleteCategory()}>Delete category</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
     <AlertDialog open={!!editingProduct} onOpenChange={open => { if (!open) setEditingProduct(null); }}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Edit product</AlertDialogTitle><AlertDialogDescription>Change its name or category. Changing the category moves its pin to the center of the new area.</AlertDialogDescription></AlertDialogHeader><label className="field-label" htmlFor="edit-product-name">Product name</label><input id="edit-product-name" value={editingProduct?.name ?? ''} onChange={event => setEditingProduct(current => current ? { ...current, name: event.target.value } : null)} onKeyDown={event => { if (event.key === 'Enter') void updateProduct(); }}/><label className="field-label">Category</label><CategoryPicker categories={store?.categories ?? []} value={editingProduct?.categoryId ?? null} onChange={categoryId => setEditingProduct(current => current ? { ...current, categoryId } : null)} label="Product category"/><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void updateProduct()}>Save product</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
-    <AlertDialog open={!!editingCategory} onOpenChange={open => { if (!open) setEditingCategory(null); }}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Rename category</AlertDialogTitle><AlertDialogDescription>Its products and map area will stay.</AlertDialogDescription></AlertDialogHeader><label className="field-label" htmlFor="edit-category-name">Category name</label><input id="edit-category-name" value={editingCategory?.name ?? ''} onChange={event => setEditingCategory(current => current ? { ...current, name: event.target.value } : null)} onKeyDown={event => { if (event.key === 'Enter') void updateCategory(); }}/><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => void updateCategory()}>Save category</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
     <footer>Made for a simpler trip to the store.</footer>
   </main>;
 }

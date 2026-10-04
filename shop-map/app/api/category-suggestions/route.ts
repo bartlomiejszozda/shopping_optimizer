@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:workers';
-import { readStore, sameOrigin, validName } from '@/lib/store';
+import { readStore, sameOrigin, validName, mapIdFromRequest } from '@/lib/store';
 
 type DecisionResponse = {
   answers?: {
@@ -15,7 +15,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json() as { name?: unknown };
     if (!validName(body.name)) return Response.json({ error: 'Enter a product name of up to 100 characters.' }, { status: 400 });
-    const categories = (await readStore()).categories;
+    const categories = (await readStore(mapIdFromRequest(request))).categories;
     if (categories.length === 0) return Response.json({ suggestions: [], recommendedCategoryId: null }, { headers: { 'Cache-Control': 'no-store' } });
     if (!env.OPENROUTER_API_KEY) return Response.json({ error: 'Add OPENROUTER_API_KEY to .dev.vars to enable AI suggestions.' }, { status: 503 });
 

@@ -1,10 +1,11 @@
 import { env } from 'cloudflare:workers';
-import { readStore, writeStore, errorResponse, sameOrigin } from '@/lib/store';
+import { readStore, writeStore, mapIdFromRequest, errorResponse, sameOrigin } from '@/lib/store';
 
-const mapKey = 'store-map';
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    const map = await env.BUCKET?.get(mapKey);
+    const current = await readStore(mapIdFromRequest(request));
+    if (!current.map) return new Response(null, { status: 404 });
+    const map = await env.BUCKET?.get(current.map.key ?? 'store-map');
     if (!map) return new Response(null, { status: 404 });
     return new Response(map.body, { headers: { 'Content-Type': map.httpMetadata?.contentType ?? 'image/png', 'Cache-Control': 'no-store' } });
   } catch (error) { return errorResponse(error); }
@@ -27,14 +28,16 @@ export async function POST(request: Request) {
     const jpg = bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255;
     const webp = new TextDecoder().decode(bytes.slice(0, 4)) === 'RIFF' && new TextDecoder().decode(bytes.slice(8, 12)) === 'WEBP';
     if (!(file.type === 'image/png' && png || file.type === 'image/jpeg' && jpg || file.type === 'image/webp' && webp)) return Response.json({ error: 'This file does not look like a supported image.' }, { status: 400 });
-    const current = await readStore();
+    const current = await readStore(mapIdFromRequest(request));
     if (current.revision !== revision) return Response.json({ error: 'This store changed in another tab. Reload before uploading.' }, { status: 409 });
+    const mapKey = `store-map-${current.mapId}-${crypto.randomUUID()}`;
     await env.BUCKET.put(mapKey, bytes, { httpMetadata: { contentType: file.type } });
     const saved = await writeStore({
       products: current.products.map(product => ({ ...product, x: null, y: null })),
       categories: current.categories.map(category => ({ ...category, area: null })),
-      shoppingList: current.shoppingList, map: { width, height, version: Date.now() },
-    }, revision);
+      shoppingList: current.shoppingList, map: { width, height, version: Date.now(), key: mapKey },
+    }, revision, current.mapId);
+    if (!saved) await env.BUCKET.delete(mapKey);
     return saved ? Response.json(saved) : Response.json({ error: 'This store changed in another tab. Reload before uploading.' }, { status: 409 });
   } catch (error) { return errorResponse(error); }
 }
