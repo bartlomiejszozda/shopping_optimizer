@@ -1,5 +1,18 @@
 # Aisle — store map and shopping list
 
+## Save and restore backups
+
+Run these commands from `shop-map` while the app is running:
+
+```sh
+docker compose exec app node scripts/backup-store.mjs
+docker compose exec app node scripts/restore-store.mjs backups/FOLDER --replace
+```
+
+Replace `FOLDER` with a dated backup folder. Restoring replaces every map present in that backup; maps that exist only in the app remain untouched. Save a fresh backup before restoring. The script checks every file checksum before contacting the app. It also accepts older single-map backups. Maps are restored one at a time, so an error partway through can leave some maps restored; the script reports each completed map.
+
+To enable restoring, set `AISLE_RESTORE_TOKEN` to a long random value in the ignored `.dev.vars` file and restart the app. For example, generate a value with `openssl rand -hex 32`. The restore script reads the same file when run from this directory. Without the token, the restore endpoint is disabled. `AISLE_URL` selects another server (default `http://127.0.0.1:5173`). After restoring, reload the browser. Backups remain ignored by Git; keep another copy outside this computer.
+
 Create named maps with **New map → Add map** and switch between them using **Current map**. Each map has its own drawing, products, categories, locations, and shopping list. Your last selection is remembered in this browser; different tabs can work on different maps. Existing data remains under **My store**, without a database migration. Upload a drawing for each store, save product points and category areas on it, and see the products from your shopping list on the map. Click a category to view it, or click its Edit pencil to change its rectangular area. In Edit mode, drag inside the area to move it, drag an edge or corner to resize it, or use “Draw new area” to replace it. Press Enter while the map is focused or click “Save changes” to commit the area and proportional movement of its assigned product pins; Cancel discards the preview. Category areas may overlap. A product appears at its own point when one is set; otherwise it appears within its category’s area. A list item without either remains in “Location unknown.” The app does not calculate routes.
 
 Existing product names, shopping lists, and map images remain intact after the category update. Products saved before categories were added appear as **Uncategorized** until you assign them. Category locations previously saved as points become small areas around those points. Create your own categories in the Categories tab. Deleting a category moves its products to Uncategorized and keeps their individual points.

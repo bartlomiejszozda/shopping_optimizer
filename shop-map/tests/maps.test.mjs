@@ -142,3 +142,83 @@ test('backup exports every map and verifies checksums', async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('restore requires an admin token and restores every map in a verified backup', async () => {
+  const { mkdtemp, readdir, readFile, writeFile, rm, mkdir, copyFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { createHash } = await import('node:crypto');
+  const { spawnSync } = await import('node:child_process');
+  const restore = await import('../app/api/restore/route.ts');
+  const disabled = await restore.POST(new Request('http://localhost/api/restore?mapId=1', {
+    method: 'POST', headers: { origin: 'http://localhost' }, body: new FormData(),
+  }));
+  assert.equal(disabled.status, 503);
+  globalThis.__testEnv.AISLE_RESTORE_TOKEN = 'test-only-restore-token';
+  const denied = await restore.POST(new Request('http://localhost/api/restore?mapId=1', {
+    method: 'POST', headers: { origin: 'http://localhost', 'X-Restore-Token': 'wrong' }, body: new FormData(),
+  }));
+  assert.equal(denied.status, 403);
+  const directory = await mkdtemp(join(tmpdir(), 'aisle-restore-test-'));
+  const previous = { fetch: globalThis.fetch, argv: process.argv, backupDir: process.env.AISLE_BACKUP_DIR, token: process.env.AISLE_RESTORE_TOKEN };
+  const localFetch = async (url, init) => {
+    const req = new Request(url, init);
+    const path = new URL(url).pathname;
+    if (path === '/api/maps') return req.method === 'POST' ? maps.POST(req) : maps.GET();
+    if (path === '/api/state') return states.GET(req);
+    if (path === '/api/map') return pictures.GET(req);
+    if (path === '/api/restore') return restore.POST(req);
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+  try {
+    await store.createStore('Second');
+    await upload(1, 0, 11); await upload(2, 1, 22);
+    await store.writeStore({ ...store.emptyStore, shoppingList: ['First'], map: (await store.readStore(1)).map }, 1, 1);
+    await store.writeStore({ ...store.emptyStore, shoppingList: ['Second'], map: (await store.readStore(2)).map }, 2, 2);
+    globalThis.fetch = localFetch;
+    process.env.AISLE_BACKUP_DIR = directory;
+    process.env.AISLE_RESTORE_TOKEN = 'test-only-restore-token';
+    await import('../scripts/backup-store.mjs?restore-test');
+    const backup = join(directory, (await readdir(directory))[0]);
+    const damaged = join(directory, 'damaged');
+    await mkdir(damaged);
+    const originalManifest = JSON.parse(await readFile(join(backup, 'manifest.json'), 'utf8'));
+    for (const name of Object.keys(originalManifest.files)) await copyFile(join(backup, name), join(damaged, name));
+    await copyFile(join(backup, 'manifest.json'), join(damaged, 'manifest.json'));
+    await writeFile(join(damaged, 'store.json'), '{}');
+    const rejected = spawnSync(process.execPath, ['scripts/restore-store.mjs', damaged, '--replace'], {
+      cwd: new URL('..', import.meta.url), env: process.env, encoding: 'utf8',
+    });
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /Checksum mismatch/);
+    await store.writeStore({ ...store.emptyStore, shoppingList: ['Changed'] }, 2, 1);
+    database.prepare('DELETE FROM store WHERE id = 2').run();
+    process.argv = [process.execPath, 'scripts/restore-store.mjs', backup, '--replace'];
+    await import('../scripts/restore-store.mjs?all-maps-test');
+    assert.deepEqual((await store.readStore(1)).shoppingList, ['First']);
+    assert.deepEqual((await store.readStore(2)).shoppingList, ['Second']);
+    assert.equal((await pictures.GET(request('/api/map?mapId=1'))).status, 200);
+    assert.equal((await pictures.GET(request('/api/map?mapId=2'))).status, 200);
+
+    // Older backups have no manifest.maps; only the original map should be restored.
+    const legacy = join(directory, 'legacy');
+    await mkdir(legacy);
+    const manifest = JSON.parse(await readFile(join(backup, 'manifest.json'), 'utf8'));
+    for (const name of ['store.json', 'store-map.png']) await copyFile(join(backup, name), join(legacy, name));
+    await writeFile(join(legacy, 'manifest.json'), JSON.stringify({ files: {
+      'store.json': manifest.files['store.json'], 'store-map.png': manifest.files['store-map.png'],
+    } }));
+    await store.writeStore({ ...store.emptyStore, shoppingList: ['Changed again'] }, 4, 1);
+    process.argv = [process.execPath, 'scripts/restore-store.mjs', legacy, '--replace'];
+    await import('../scripts/restore-store.mjs?legacy-test');
+    assert.deepEqual((await store.readStore(1)).shoppingList, ['First']);
+    assert.deepEqual((await store.readStore(2)).shoppingList, ['Second']);
+    assert.equal(createHash('sha256').update(await readFile(join(legacy, 'store-map.png'))).digest('hex'), manifest.files['store-map.png']);
+  } finally {
+    globalThis.fetch = previous.fetch; process.argv = previous.argv;
+    if (previous.backupDir === undefined) delete process.env.AISLE_BACKUP_DIR; else process.env.AISLE_BACKUP_DIR = previous.backupDir;
+    if (previous.token === undefined) delete process.env.AISLE_RESTORE_TOKEN; else process.env.AISLE_RESTORE_TOKEN = previous.token;
+    delete globalThis.__testEnv.AISLE_RESTORE_TOKEN;
+    await rm(directory, { recursive: true, force: true });
+  }
+});

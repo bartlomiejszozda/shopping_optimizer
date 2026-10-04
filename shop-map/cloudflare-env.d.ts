@@ -3,5 +3,6 @@ declare namespace Cloudflare {
     DB?: D1Database;
     BUCKET?: R2Bucket;
     OPENROUTER_API_KEY?: string;
+    AISLE_RESTORE_TOKEN?: string;
   }
 }
