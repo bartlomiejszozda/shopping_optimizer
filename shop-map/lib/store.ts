@@ -1,16 +1,21 @@
 import { env } from 'cloudflare:workers';
+import { upgradeStoreDocument } from './catalog';
 
-export type Product = { id: string; name: string; x: number | null; y: number | null };
-export type StoreData = { products: Product[]; shoppingList: string[]; map: { width: number; height: number; version: number } | null };
+export type Product = { id: string; name: string; categoryId: string | null; x: number | null; y: number | null };
+export type Area = { x: number; y: number; width: number; height: number };
+export type Category = { id: string; name: string; area: Area | null };
+export type StoreData = { products: Product[]; categories: Category[]; shoppingList: string[]; map: { width: number; height: number; version: number } | null };
 export type StoreSnapshot = StoreData & { revision: number };
 
-export const emptyStore: StoreData = { products: [], shoppingList: [], map: null };
+export const emptyStore: StoreData = { products: [], categories: [], shoppingList: [], map: null };
 
 export async function readStore(): Promise<StoreSnapshot> {
   const db = env.DB;
   if (!db) throw new Error('Store database is unavailable');
   const row = await db.prepare('SELECT document, revision FROM store WHERE id = 1').first<{ document: string; revision: number }>();
-  return row ? { ...JSON.parse(row.document) as StoreData, revision: row.revision } : { ...emptyStore, revision: 0 };
+  if (!row) return { ...emptyStore, revision: 0 };
+  const document = JSON.parse(row.document) as Partial<StoreData>;
+  return { ...upgradeStoreDocument(document), revision: row.revision };
 }
 
 export async function writeStore(data: StoreData, expectedRevision: number): Promise<StoreSnapshot | null> {
@@ -35,7 +40,25 @@ export function validProduct(value: unknown): value is Product {
   if (!value || typeof value !== 'object') return false;
   const item = value as Partial<Product>;
   return typeof item.id === 'string' && /^[0-9a-f-]{36}$/i.test(item.id) && validName(item.name)
-    && (item.x === null && item.y === null || typeof item.x === 'number' && typeof item.y === 'number' && Number.isFinite(item.x) && Number.isFinite(item.y) && item.x >= 0 && item.x <= 1 && item.y >= 0 && item.y <= 1);
+    && (item.categoryId === null || typeof item.categoryId === 'string' && /^[0-9a-f-]{36}$/i.test(item.categoryId))
+    && validCoordinates(item);
+}
+export function validCategory(value: unknown): value is Category {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Partial<Category>;
+  return typeof item.id === 'string' && /^[0-9a-f-]{36}$/i.test(item.id) && validName(item.name)
+    && normalizeName(item.name) !== 'uncategorized' && (item.area === null || validArea(item.area));
+}
+function validArea(area: unknown): area is Area {
+  if (!area || typeof area !== 'object') return false;
+  const item = area as Partial<Area>;
+  return [item.x, item.y, item.width, item.height].every(value => typeof value === 'number' && Number.isFinite(value))
+    && item.x! >= 0 && item.y! >= 0 && item.width! >= 0.005 && item.height! >= 0.005
+    && item.x! + item.width! <= 1.000001 && item.y! + item.height! <= 1.000001;
+}
+function validCoordinates(item: { x?: number | null; y?: number | null }) {
+  return item.x === null && item.y === null || typeof item.x === 'number' && typeof item.y === 'number'
+    && Number.isFinite(item.x) && Number.isFinite(item.y) && item.x >= 0 && item.x <= 1 && item.y >= 0 && item.y <= 1;
 }
 export function errorResponse(error: unknown): Response {
   console.error('Store request failed', error);

@@ -4,3 +4,7 @@ dist
 .wrangler
 .sites-runtime
 .git
+.dev.vars*
+.env*
+host-ca.crt
+backups

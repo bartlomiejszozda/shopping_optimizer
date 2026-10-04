@@ -30,7 +30,11 @@ export async function POST(request: Request) {
     const current = await readStore();
     if (current.revision !== revision) return Response.json({ error: 'This store changed in another tab. Reload before uploading.' }, { status: 409 });
     await env.BUCKET.put(mapKey, bytes, { httpMetadata: { contentType: file.type } });
-    const saved = await writeStore({ products: current.products.map(product => ({ ...product, x: null, y: null })), shoppingList: current.shoppingList, map: { width, height, version: Date.now() } }, revision);
+    const saved = await writeStore({
+      products: current.products.map(product => ({ ...product, x: null, y: null })),
+      categories: current.categories.map(category => ({ ...category, area: null })),
+      shoppingList: current.shoppingList, map: { width, height, version: Date.now() },
+    }, revision);
     return saved ? Response.json(saved) : Response.json({ error: 'This store changed in another tab. Reload before uploading.' }, { status: 409 });
   } catch (error) { return errorResponse(error); }
 }

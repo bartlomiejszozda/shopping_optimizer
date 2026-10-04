@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Aisle · Your store map",
-  description: "Remember product locations and see your shopping list on your own store map.",
+  description: "Remember product and category locations and see your shopping list on your store map.",
   other: {
     "codex-preview": "development",
   },
